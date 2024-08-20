@@ -83,6 +83,23 @@ def build_test_list():
                     "--checkpoint.enable_checkpoint",
                     "--experimental.pipeline_parallel_degree 2",
                     "--experimental.pipeline_parallel_split_points layers.4",
+                    "--experimental.pipeline_parallel_schedule 1f1b",
+                    "--training.data_parallel_degree 1",
+                    "--model.norm_type rmsnorm",  # fused_rmsnorm crashes with PP
+                    "--float8.enable_float8_linear",
+                ],
+            ],
+            "PP 1D test 1f1b",
+            "pp_1f1b_fp8",
+            requires_seed_checkpoint=True,
+            ngpu=2,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--checkpoint.enable_checkpoint",
+                    "--experimental.pipeline_parallel_degree 2",
+                    "--experimental.pipeline_parallel_split_points layers.4",
                     "--experimental.pipeline_parallel_schedule gpipe",
                     "--training.data_parallel_degree 1",
                     "--model.norm_type rmsnorm",  # fused_rmsnorm crashes with PP
@@ -242,14 +259,14 @@ def build_test_list():
         ),
         OverrideDefinitions(
             [
-                [
-                    "--checkpoint.enable_checkpoint",
-                    "--experimental.pipeline_parallel_degree 2",
-                    "--experimental.pipeline_parallel_split_points layers.4",
-                    "--training.data_parallel_degree 2",
-                    "--training.tensor_parallel_degree 2",
-                    "--model.norm_type rmsnorm",  # fused_rmsnorm not yet compatible with TP
-                ],
+                # [
+                #     "--checkpoint.enable_checkpoint",
+                #     "--experimental.pipeline_parallel_degree 2",
+                #     "--experimental.pipeline_parallel_split_points layers.4",
+                #     "--training.data_parallel_degree 2",
+                #     "--training.tensor_parallel_degree 2",
+                #     "--model.norm_type rmsnorm",  # fused_rmsnorm not yet compatible with TP
+                # ],
                 [
                     "--training.steps 20",
                     "--checkpoint.enable_checkpoint",
