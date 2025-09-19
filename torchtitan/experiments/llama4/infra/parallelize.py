@@ -350,18 +350,31 @@ def apply_fsdp(
                 _experts_shard_placement_fn = lambda param: Shard(1)
 
             fully_shard(
-                transformer_block.moe.experts,
+                transformer_block._checkpoint_wrapped_module.moe.experts if hasattr(transformer_block, "_checkpoint_wrapped_module") else transformer_block.moe.experts,
                 **fsdp_mod_ep_config,
                 reshard_after_forward=reshard_after_forward,
                 shard_placement_fn=_experts_shard_placement_fn,
             )
-
             # NOTE: # Although the FSDP sharding of experts is done on a mesh of
             #       a different size than other parameters, the gradient division
             #       factor should be consistent with data.
             transformer_block.moe.experts.set_gradient_divide_factor(
                 gradient_divide_factor,
             )
+        else:
+            if transformer_block.moe_enabled:
+                fully_shard(
+                    transformer_block._checkpoint_wrapped_module.moe.experts if hasattr(transformer_block, "_checkpoint_wrapped_module") else transformer_block.moe.experts,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    shard_placement_fn=lambda param: Shard(1),
+                )
+            else:
+                fully_shard(
+                    transformer_block._checkpoint_wrapped_module.feed_forward if hasattr(transformer_block, "_checkpoint_wrapped_module") else transformer_block.feed_forward,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                )
 
         fully_shard(
             transformer_block,
