@@ -6,9 +6,6 @@
 
 import torch
 import torch.nn as nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointWrapper,
-)
 
 from torchtitan.config import CompileConfig
 from torchtitan.models.common.moe import moe as moe_module
@@ -49,8 +46,8 @@ def apply_compile_sparse(
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
 
-    This is for MoE (sparse) models. It compiles sub-modules individually to avoid
-    graph breaks from FSDP(GroupedExperts).
+    This is for MoE (sparse) models. With per-param mesh FSDP2 (no nested FSDP on
+    experts), we can compile each TransformerBlock as a whole.
     """
     # Needed for torch.compile to avoid graph breaking on dynamic shapes in
     # token-choice MoE, but it is experimental.
@@ -66,58 +63,9 @@ def apply_compile_sparse(
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():
-        if transformer_block.moe_enabled:
-            # If it is a MoE layer, FSDP(GroupedExperts) will cause a graph break
-            # So we must weave compile wrappers around those FSDP hooks to
-            # prevent AC from falling back the whole graph to eager.
-            # TODO: Fix Compile(AC(graph break))
-
-            if isinstance(transformer_block, CheckpointWrapper):
-                # TODO: Make CheckpointWrapper a transparent wrapper
-                # unwrap so that .named_children() works
-                block = transformer_block._checkpoint_wrapped_module
-            else:
-                block = transformer_block
-
-            for attr_name, submod in block.named_children():
-                assert getattr(block, attr_name) == getattr(
-                    transformer_block, attr_name
-                )
-
-                if isinstance(submod, moe_module.MoE):
-                    # avoid graph breaking on the GroupedExperts' FSDP hooks
-                    # by wrapping each submod's forward instead of their __call__
-                    moe = submod
-                    for attr_name, submod in moe.named_children():
-                        if attr_name == "experts":
-                            # NOTE: We don't compile token dispatch and token combine due to an issue on B200:
-                            # https://github.com/pytorch/torchtitan/issues/1940
-                            continue
-                        setattr(
-                            moe,
-                            attr_name,
-                            torch.compile(
-                                submod, backend=compile_config.backend, fullgraph=True
-                            ),
-                        )
-                else:
-                    setattr(
-                        block,
-                        attr_name,
-                        torch.compile(
-                            submod, backend=compile_config.backend, fullgraph=True
-                        ),
-                    )
-
-        else:
-            # If it's not a MoE layer, there is no FSDP(GroupedExperts)
-            # So we can compile the whole block
-            transformer_block = torch.compile(
-                transformer_block,
-                backend=compile_config.backend,
-                fullgraph=True,
-            )
-
+        transformer_block = torch.compile(
+            transformer_block, backend=compile_config.backend, fullgraph=True
+        )
         # pyrefly: ignore [missing-attribute]
         model.layers.register_module(layer_id, transformer_block)
 

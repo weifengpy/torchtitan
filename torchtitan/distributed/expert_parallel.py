@@ -119,6 +119,13 @@ class ExpertParallel(BaseExpertParallel):
             self.input_splits = input_splits.tolist()
             self.output_splits = output_splits.tolist()
 
+        # torch._check informs the compiler that split sizes are
+        # non-negative, avoiding unbacked symint guard failures.
+        for s in self.input_splits:
+            torch._check(s >= 0)
+        for s in self.output_splits:
+            torch._check(s >= 0)
+
         # perform all-to-all
         routed_input = all_to_all_single_autograd(
             routed_input,
