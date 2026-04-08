@@ -32,6 +32,9 @@ from torch.fx.passes.regional_inductor import regional_inductor
 from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.distributed.activation_checkpoint import _get_save_ops
+from torchtitan.experiments.flex_shard.reshard_after_forward import (
+    flex_shard_reshard_after_fwd_pass,
+)
 from torchtitan.experiments.graph_trainer.common_utils import _AC_REGION_ID
 from torchtitan.experiments.graph_trainer.reshard_after_forward import (
     annotate_fsdp_all_gather,
@@ -489,6 +492,7 @@ AVAILABLE_COMPILER_PASSES = {
 AVAILABLE_JOINT_PASSES = {
     "inductor_decomposition": inductor_decomposition_pass,
     "fsdp_reshard_after_fwd": fsdp_reshard_after_fwd_pass,
+    "flex_shard_reshard_after_fwd": flex_shard_reshard_after_fwd_pass,
     "validate_flex_attn_annotation": validate_flex_attn_annotation_pass,
     "apply_sac": apply_sac_pass,
 }
