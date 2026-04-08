@@ -13,7 +13,6 @@ Requires a CUDA GPU. Run with:
     pytest torchtitan/experiments/graph_trainer/tests/test_bitwise_deterministic.py -x
 """
 
-import contextlib
 import copy
 import unittest
 from collections.abc import Callable
@@ -62,7 +61,6 @@ def _build_trainer(model: nn.Module, model_config, trainer_cls: type) -> Trainer
     trainer.loss_fn = cross_entropy_loss
     trainer.parallel_dims = SimpleNamespace(pp_enabled=False, cp_enabled=False)
     trainer.train_context = get_train_context(False)
-    trainer.maybe_enable_amp = contextlib.nullcontext()
     trainer.model_config = model_config
     trainer.device = torch.device("cuda")
 
