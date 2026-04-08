@@ -81,6 +81,10 @@ class ParallelDims:
             # We always keep the efsdp if EP is larger than 1 because we need
             # FSDP wrapping to help the MoE layers do mixed precision training.
             return True if self.ep > 1 else False
+        if name == "dp_replicate":
+            # Always keep dp_replicate mesh with real backend so replicate()
+            # can apply MixedPrecisionPolicy even on single device.
+            return True
         return degree > 1
 
     def build_mesh(self) -> DeviceMesh:

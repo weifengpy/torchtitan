@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.distributed._composable.replicate_with_fsdp import replicate
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
@@ -24,7 +25,10 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
-from torchtitan.models.llama3.parallelize import disable_fsdp_gradient_division
+from torchtitan.models.llama3.parallelize import (
+    apply_replicate,
+    disable_fsdp_gradient_division,
+)
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
 
@@ -67,6 +71,13 @@ def parallelize_flux(
             logger.info("Applied HSDP to the model")
         else:
             logger.info("Applied FSDP to the model")
+    else:
+        apply_replicate(
+            model,
+            parallel_dims.get_mesh("dp_replicate"),
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        )
 
     return model
 
@@ -211,15 +222,16 @@ def parallelize_encoders(
     *,
     training: TrainingConfig,
 ):
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+    )
+
     if parallel_dims.dp_shard_enabled:  # apply FSDP or HSDP
         names = (
             ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
         )
 
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        )
         dp_mesh = parallel_dims.get_mesh(names)
         fsdp_config: dict[str, Any] = {
             "mesh": dp_mesh,
@@ -244,5 +256,20 @@ def parallelize_encoders(
             logger.info("Applied HSDP to the T5 encoder model")
         else:
             logger.info("Applied FSDP to the T5 encoder model")
+    else:
+        replicate_config = {
+            "mesh": parallel_dims.get_mesh("dp_replicate"),
+            "mp_policy": mp_policy,
+        }
+        # pyrefly: ignore [missing-attribute]
+        for block in t5_model.hf_module.encoder.block:
+            replicate(block, **replicate_config)
+        # pyrefly: ignore [no-matching-overload]
+        replicate(t5_model.hf_module, **replicate_config)
+
+        # pyrefly: ignore [bad-argument-type]
+        disable_fsdp_gradient_division(t5_model.hf_module)
+
+        logger.info("Applied replicate to the T5 encoder model")
 
     return t5_model, clip_model

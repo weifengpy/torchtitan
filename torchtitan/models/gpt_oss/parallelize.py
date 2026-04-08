@@ -165,7 +165,7 @@ def parallelize_gptoss(
 
         if training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
-    elif parallel_dims.dp_replicate_enabled:
+    else:
         apply_replicate(
             model,
             parallel_dims.get_mesh("dp_replicate"),
