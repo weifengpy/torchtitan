@@ -115,7 +115,7 @@ def get_extra_fsdp_pg_name(original_pg_name: str) -> str | None:
     return _EXTRA_FSDP_PG_REGISTRY.get(original_pg_name)
 
 
-def get_transformer_block_buckets(model) -> list[list[str] | str]:
+def get_buckets(model) -> list[list[str] | str]:
     """Get transformer block buckets for manual bucketing passes.
 
     Works for any model with tok_embeddings, layers (OrderedDict), norm, and output
