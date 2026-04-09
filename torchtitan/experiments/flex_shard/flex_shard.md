@@ -1,7 +1,5 @@
 # FlexShard
 
-Implementation: https://github.com/pytorch/pytorch/pull/174267
-
 ## Motivation
 
 FSDP1, FSDP2, and veScale-FSDP each exist because of a different sharding strategy: FSDP1 introduced `FlatShard` (flat-concat sharding), FSDP2 introduced per-param `Shard(0)`, and veScale-FSDP introduced `RaggedShard` for asymmetric chunk sizes. Yet the scaffolding around these strategies is the same every time — unshard/reshard lifecycle hooks, all-gather/reduce-scatter scheduling, buffer management, CPU offloading, gradient reduction. Each new sharding strategy required reinventing this scaffolding from scratch.

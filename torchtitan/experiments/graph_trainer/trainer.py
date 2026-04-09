@@ -47,6 +47,26 @@ class GraphTrainer(Trainer):
             default_factory=GraphTrainerCompileConfig
         )
 
+    def _get_model_build_device(self) -> str:
+        """Build on CPU so FlexShard sees real tensors at flex_shard() time."""
+        return "cpu"
+
+    def _init_model_weights(self, model, init_device, buffer_device):
+        """Initialize weights in-place (model already on CPU, not meta).
+
+        No to_empty() needed — the model was built on CPU via
+        _get_model_build_device(). Just init weights and move to CUDA.
+        """
+        from typing import cast
+
+        from torchtitan.protocols import BaseModel
+
+        with torch.no_grad():
+            cast(BaseModel, model).init_weights(buffer_device=buffer_device)
+        # Move to target device after init (CPU→CUDA)
+        if init_device != "cpu":
+            model.to(init_device)
+
     def __init__(self, config):
         super().__init__(config)
 

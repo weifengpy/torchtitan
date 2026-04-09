@@ -88,6 +88,23 @@ class Placement:
         """
         raise NotImplementedError
 
+    def create_parametrization(
+        self,
+        info: ParamInfo,
+        group_name: str,
+        world_size: int,
+        param_dtype: torch.dtype | None = None,
+        reduce_dtype: torch.dtype | None = None,
+        compute_device: torch.device | None = None,
+    ) -> nn.Module:
+        """Create an FX-traceable parametrization module for this placement.
+
+        Called by flex_shard() to build the property-getter parametrization
+        that emits _c10d_functional ops. Subclasses override to return their
+        specific parametrization class.
+        """
+        raise NotImplementedError
+
     @classmethod
     def unshard(
         cls,
@@ -125,6 +142,20 @@ class Shard(Placement):
 
     def __repr__(self) -> str:
         return f"Shard({self.dim})"
+
+    def create_parametrization(self, info, group_name, world_size, **kwargs):
+        dim_size = info.global_shape[self.dim]
+        uneven = dim_size % world_size != 0
+        return ShardParametrization(
+            shard_dim=self.dim,
+            group_name=group_name,
+            world_size=world_size,
+            padded_shard_size=(
+                (dim_size + world_size - 1) // world_size if uneven else None
+            ),
+            global_dim_size=dim_size if uneven else None,
+            **kwargs,
+        )
 
     def compute_local_shape(
         self, global_shape: torch.Size, rank: int, world_size: int
@@ -295,6 +326,20 @@ class FlatShard(Placement):
     flat_offset: int = 0
     numel: int = 0
     total_flat_numel: int = 0
+
+    def create_parametrization(self, info, group_name, world_size, **kwargs):
+        numel = info.global_numel
+        flat_uneven = numel % world_size != 0
+        return FlatShardParametrization(
+            group_name=group_name,
+            world_size=world_size,
+            original_shape=info.global_shape,
+            padded_shard_size=(
+                (numel + world_size - 1) // world_size if flat_uneven else None
+            ),
+            global_numel=numel if flat_uneven else None,
+            **kwargs,
+        )
 
     def _intersection(self, rank: int, world_size: int) -> tuple[int, int]:
         """Compute overlap between this param's flat range and a rank's flat range.
@@ -498,54 +543,42 @@ def _validate_placements_for_tracing(
     named_params: list[tuple[str, nn.Parameter]],
     mesh: DeviceMesh,
 ) -> None:
-    """Validate that placements are compatible with FX tracing (Phase 1).
+    """Validate that placements are compatible with FX tracing.
 
-    Raises ValueError if any placement uses features not yet supported by
-    the traceable parametrization classes (Owned, RaggedShard, uneven splits,
-    or multi-dimensional meshes).
+    Raises ValueError if any placement uses invalid configuration.
+    The mesh passed to flex_shard() should be the 1D DP sub-mesh; when
+    TP/EP is composed, the multi-dim mesh lives on the DTensor parameters.
     """
-    if mesh.ndim != 1:
-        raise ValueError(
-            f"Traceable FlexShard requires a 1D mesh, got {mesh.ndim}D. "
-            "Multi-dimensional mesh support is planned for Phase 5+."
-        )
-
     param_dict = dict(named_params)
     world_size = mesh.size()
 
     for fqn, placements in param_placements.items():
         for placement in placements:
             if isinstance(placement, Owned):
-                raise ValueError(
-                    f"Parameter '{fqn}' uses Owned placement, which is not "
-                    "supported for tracing. Owned placement requires "
-                    "rank-dependent control flow that cannot be captured in "
-                    "an FX graph. Support is planned for Phase 5+."
-                )
+                if placement.owner_rank >= mesh.size():
+                    raise ValueError(
+                        f"Parameter '{fqn}' uses Owned({placement.owner_rank}) "
+                        f"but world_size is {mesh.size()}."
+                    )
             if isinstance(placement, RaggedShard):
-                raise ValueError(
-                    f"Parameter '{fqn}' uses RaggedShard placement, which is "
-                    "not supported for tracing. RaggedShard requires "
-                    "variable-size collectives that cannot be traced. "
-                    "Support is planned for Phase 5+."
-                )
+                if len(placement.local_units) != world_size:
+                    raise ValueError(
+                        f"Parameter '{fqn}' uses RaggedShard with "
+                        f"{len(placement.local_units)} local_units but "
+                        f"world_size is {world_size}."
+                    )
             if isinstance(placement, Shard):
                 param = param_dict[fqn]
-                dim_size = param.shape[placement.dim]
-                if dim_size % world_size != 0:
+                if placement.dim >= param.ndim:
                     raise ValueError(
-                        f"Parameter '{fqn}' has shape {tuple(param.shape)} with "
-                        f"dim {placement.dim} size {dim_size}, which is not "
-                        f"evenly divisible by world_size={world_size}. "
-                        "Use FlatShard or pad the parameter."
+                        f"Parameter '{fqn}' has {param.ndim} dimensions but "
+                        f"Shard(dim={placement.dim}) is out of range."
                     )
             if isinstance(placement, FlatShard):
                 param = param_dict[fqn]
-                if param.numel() % world_size != 0:
+                if param.numel() == 0:
                     raise ValueError(
-                        f"Parameter '{fqn}' has {param.numel()} elements, "
-                        f"which is not evenly divisible by "
-                        f"world_size={world_size}. Pad the parameter."
+                        f"Parameter '{fqn}' has 0 elements, " "cannot apply FlatShard."
                     )
 
 
@@ -645,6 +678,30 @@ def _validate_bucket_placements(
                         "All Shard params in a bucket must share the same "
                         "dimension."
                     )
+            if isinstance(placement, Owned) and isinstance(reference_placement, Owned):
+                if placement.owner_rank != reference_placement.owner_rank:
+                    raise ValueError(
+                        f"Bucket {bucket_idx} "
+                        f"{_get_bucket_patterns(buckets[bucket_idx])} "
+                        f"has mixed owner ranks: '{fqns[0]}' uses "
+                        f"Owned({reference_placement.owner_rank}) but "
+                        f"'{fqn}' uses Owned({placement.owner_rank}). "
+                        "All Owned params in a bucket must share the same "
+                        "owner_rank."
+                    )
+            if isinstance(placement, RaggedShard) and isinstance(
+                reference_placement, RaggedShard
+            ):
+                if placement.local_units != reference_placement.local_units:
+                    raise ValueError(
+                        f"Bucket {bucket_idx} "
+                        f"{_get_bucket_patterns(buckets[bucket_idx])} "
+                        f"has mixed local_units: '{fqns[0]}' uses "
+                        f"{reference_placement.local_units} but '{fqn}' uses "
+                        f"{placement.local_units}. "
+                        "All RaggedShard params in a bucket must share the "
+                        "same local_units."
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -688,10 +745,32 @@ def _register_parametrization(
     """
     global _wrap_class_counter
     _wrap_class_counter += 1
+
+    def _make_getter(pn, p):
+        def getter(self):
+            # In eager batched mode, _pre_gathered is set on the
+            # parametrization by the batched all-gather pre_forward hook.
+            # Return as a detached leaf — reduce-scatter is handled by
+            # _RegisterPostBackward on the layer's forward inputs.
+            pre = getattr(p, "_pre_gathered", None)
+            if pre is not None:
+                p._pre_gathered = None
+                param_dtype = getattr(p, "param_dtype", None)
+                if param_dtype is not None and pre.dtype != param_dtype:
+                    pre = pre.to(param_dtype)
+                unsharded = pre.detach().requires_grad_(True)
+                # Only store on FIRST forward (not during checkpoint
+                # recomputation). The original leaf is what checkpoint
+                # saves and autograd accumulates grad on.
+                if getattr(p, "_unsharded_for_reduce", None) is None:
+                    p._unsharded_for_reduce = unsharded
+                return unsharded
+            return p(self._parameters[pn])
+
+        return getter
+
     param_name_to_property = {
-        param_name: property(
-            lambda self, pn=param_name, p=param: p(self._parameters[pn])
-        )
+        param_name: property(_make_getter(param_name, param))
         for param_name, param in param_parametrizations.items()
     }
     module_cls = type(
@@ -938,6 +1017,45 @@ class Owned(Placement):
         return results
 
 
+class _OwnedFullCopy(Owned):
+    """Internal variant of Owned used in parametrization mode.
+
+    All ranks store a full copy of the parameter (not just the owner).
+    This enables FX-traceable broadcast from owner_rank via
+    OwnedParametrization. The memory overhead is acceptable since Owned
+    is typically used for small params (biases, norms).
+    """
+
+    def create_parametrization(self, info, group_name, world_size, **kwargs):
+        return OwnedParametrization(
+            owner_rank=self.owner_rank,
+            group_name=group_name,
+            world_size=world_size,
+            **kwargs,
+        )
+
+    def compute_local_shape(
+        self, global_shape: torch.Size, rank: int, world_size: int
+    ) -> torch.Size:
+        return global_shape
+
+    def compute_local_numel(
+        self, global_shape: torch.Size, rank: int, world_size: int
+    ) -> int:
+        numel = 1
+        for d in global_shape:
+            numel *= d
+        return numel
+
+    def extract_local_shard(
+        self,
+        param: torch.Tensor,
+        rank: int,
+        world_size: int,
+    ) -> torch.Tensor:
+        return param.contiguous()
+
+
 class RaggedShard(Placement):
     """Asymmetric sharding — variable chunk sizes per rank.
 
@@ -968,6 +1086,16 @@ class RaggedShard(Placement):
 
     def __repr__(self) -> str:
         return f"RaggedShard(dims={self.dims}, local_units={self.local_units})"
+
+    def create_parametrization(self, info, group_name, world_size, **kwargs):
+        split_sizes = self._compute_dim_splits(info.global_shape[self.dim])
+        return RaggedShardParametrization(
+            shard_dim=self.dim,
+            split_sizes=split_sizes,
+            group_name=group_name,
+            world_size=world_size,
+            **kwargs,
+        )
 
     def _compute_dim_splits(self, dim_size: int) -> list[int]:
         """Compute per-rank sizes along the sharded dimension.
@@ -1100,6 +1228,10 @@ class ShardParametrization(nn.Module):
 
     For dim != 0, all_gather_into_tensor concatenates along dim 0, so we
     chunk and re-cat along the correct shard_dim.
+
+    For uneven splits (dim_size % world_size != 0), each rank pads its local
+    shard to ``padded_shard_size`` before all-gather, then slices the result
+    back to ``global_dim_size`` along ``shard_dim``.
     """
 
     def __init__(
@@ -1110,6 +1242,8 @@ class ShardParametrization(nn.Module):
         param_dtype: torch.dtype | None = None,
         reduce_dtype: torch.dtype | None = None,
         compute_device: torch.device | None = None,
+        padded_shard_size: int | None = None,
+        global_dim_size: int | None = None,
     ):
         super().__init__()
         self.shard_dim = shard_dim
@@ -1118,6 +1252,8 @@ class ShardParametrization(nn.Module):
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
         self.compute_device = compute_device
+        self.padded_shard_size = padded_shard_size
+        self.global_dim_size = global_dim_size
 
     def forward(self, local_shard: torch.Tensor) -> torch.Tensor:
         if not _active_parametrization:
@@ -1127,6 +1263,17 @@ class ShardParametrization(nn.Module):
             and local_shard.device != self.compute_device
         ):
             local_shard = local_shard.to(self.compute_device, non_blocking=True)
+
+        # Pad local shard to uniform size if uneven
+        if self.padded_shard_size is not None:
+            local_size = local_shard.shape[self.shard_dim]
+            pad_size = self.padded_shard_size - local_size
+            if pad_size > 0:
+                pad_shape = list(local_shard.shape)
+                pad_shape[self.shard_dim] = pad_size
+                padding = local_shard.new_zeros(pad_shape)
+                local_shard = torch.cat([local_shard, padding], dim=self.shard_dim)
+
         full = torch.ops._c10d_functional.all_gather_into_tensor(
             local_shard, self.world_size, self.group_name
         )
@@ -1134,6 +1281,11 @@ class ShardParametrization(nn.Module):
         if self.shard_dim != 0:
             chunks = full.chunk(self.world_size, dim=0)
             full = torch.cat(chunks, dim=self.shard_dim)
+
+        # Slice out padding if uneven
+        if self.global_dim_size is not None:
+            full = full.narrow(self.shard_dim, 0, self.global_dim_size)
+
         if self.param_dtype is not None or self.reduce_dtype is not None:
             full = _MixedPrecisionCast.apply(full, self.param_dtype, self.reduce_dtype)
         return full
@@ -1145,6 +1297,14 @@ class FlatShardParametrization(nn.Module):
     Reconstructs the full parameter from a flat 1D shard using
     _c10d_functional ops. The flat shard has shape (numel // world_size,).
     After all-gather, the result is reshaped to the original parameter shape.
+
+    flex_shard() decomposes bucket-level FlatShard into per-parameter flat
+    sharding in parametrization mode: each param gets FlatShard(0, numel, numel)
+    so every rank holds exactly numel // world_size elements.
+
+    For uneven splits (numel % world_size != 0), each rank pads its flat shard
+    to ``padded_shard_size`` before all-gather, then slices the result back to
+    ``global_numel`` before reshaping.
     """
 
     def __init__(
@@ -1155,6 +1315,8 @@ class FlatShardParametrization(nn.Module):
         param_dtype: torch.dtype | None = None,
         reduce_dtype: torch.dtype | None = None,
         compute_device: torch.device | None = None,
+        padded_shard_size: int | None = None,
+        global_numel: int | None = None,
     ):
         super().__init__()
         self.group_name = group_name
@@ -1163,17 +1325,33 @@ class FlatShardParametrization(nn.Module):
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
         self.compute_device = compute_device
+        self.padded_shard_size = padded_shard_size
+        self.global_numel = global_numel
 
     def forward(self, flat_shard: torch.Tensor) -> torch.Tensor:
         if not _active_parametrization:
             return flat_shard
         if self.compute_device is not None and flat_shard.device != self.compute_device:
             flat_shard = flat_shard.to(self.compute_device, non_blocking=True)
+
+        # Pad flat shard to uniform size if uneven
+        if self.padded_shard_size is not None:
+            pad_size = self.padded_shard_size - flat_shard.numel()
+            if pad_size > 0:
+                padding = flat_shard.new_zeros(pad_size)
+                flat_shard = torch.cat([flat_shard, padding])
+
         full_flat = torch.ops._c10d_functional.all_gather_into_tensor(
             flat_shard, self.world_size, self.group_name
         )
         full_flat = torch.ops._c10d_functional.wait_tensor(full_flat)
+
+        # Slice off padding if uneven
+        if self.global_numel is not None:
+            full_flat = full_flat[: self.global_numel]
+
         full = full_flat.view(self.original_shape)
+
         if self.param_dtype is not None or self.reduce_dtype is not None:
             full = _MixedPrecisionCast.apply(full, self.param_dtype, self.reduce_dtype)
         return full
@@ -1205,6 +1383,253 @@ class _MixedPrecisionCast(torch.autograd.Function):
         if ctx.reduce_dtype is not None and grad.dtype != ctx.reduce_dtype:
             return grad.to(ctx.reduce_dtype), None, None
         return grad, None, None
+
+
+class _OwnedBroadcast(torch.autograd.Function):
+    """Differentiable broadcast for Owned placement.
+
+    Forward: broadcast from owner_rank to all ranks.
+    Backward: all_reduce(sum) / world_size (averaged gradient to all ranks).
+
+    _c10d_functional.broadcast has no backward registered, so this custom
+    autograd function provides the gradient flow.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        param: torch.Tensor,
+        owner_rank: int,
+        group_name: str,
+        world_size: int,
+    ) -> torch.Tensor:
+        ctx.group_name = group_name
+        ctx.world_size = world_size
+        result = torch.ops._c10d_functional.broadcast(param, owner_rank, group_name)
+        return torch.ops._c10d_functional.wait_tensor(result)
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        reduced = torch.ops._c10d_functional.all_reduce(grad, "sum", ctx.group_name)
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        return reduced / ctx.world_size, None, None, None
+
+
+class OwnedParametrization(nn.Module):
+    """FX-traceable parametrization for Owned placement.
+
+    In parametrization mode, all ranks store a full copy of the parameter
+    (unlike hooks mode where only the owner stores it). The broadcast from
+    owner_rank ensures consistency; the backward all-reduce averages
+    gradients across all ranks. Since all ranks hold the same param values
+    and receive the same averaged gradient, the optimizer produces identical
+    updates — keeping all copies in sync without explicit synchronization.
+    """
+
+    def __init__(
+        self,
+        owner_rank: int,
+        group_name: str,
+        world_size: int,
+        param_dtype: torch.dtype | None = None,
+        reduce_dtype: torch.dtype | None = None,
+        compute_device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.owner_rank = owner_rank
+        self.group_name = group_name
+        self.world_size = world_size
+        self.param_dtype = param_dtype
+        self.reduce_dtype = reduce_dtype
+        self.compute_device = compute_device
+
+    def forward(self, param: torch.Tensor) -> torch.Tensor:
+        if not _active_parametrization:
+            return param
+        if self.compute_device is not None and param.device != self.compute_device:
+            param = param.to(self.compute_device, non_blocking=True)
+        # Owned always uses per-param broadcast (can't batch across
+        # different owner_ranks). No _pre_gathered support needed.
+        full = _OwnedBroadcast.apply(
+            param, self.owner_rank, self.group_name, self.world_size
+        )
+        if self.param_dtype is not None or self.reduce_dtype is not None:
+            full = _MixedPrecisionCast.apply(full, self.param_dtype, self.reduce_dtype)
+        return full
+
+
+class RaggedShardParametrization(nn.Module):
+    """FX-traceable parametrization for RaggedShard placement.
+
+    Uses pad-to-uniform: each rank pads its local shard to the maximum shard
+    size across all ranks, then uniform all_gather_into_tensor, then narrow
+    each chunk to its real size and cat to reconstruct the full parameter.
+    The backward (reduce-scatter + slice) is autograd-generated.
+    """
+
+    def __init__(
+        self,
+        shard_dim: int,
+        split_sizes: list[int],
+        group_name: str,
+        world_size: int,
+        param_dtype: torch.dtype | None = None,
+        reduce_dtype: torch.dtype | None = None,
+        compute_device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.shard_dim = shard_dim
+        self.split_sizes = split_sizes
+        self.max_shard_size = max(split_sizes)
+        self.group_name = group_name
+        self.world_size = world_size
+        self.param_dtype = param_dtype
+        self.reduce_dtype = reduce_dtype
+        self.compute_device = compute_device
+
+    def forward(self, local_shard: torch.Tensor) -> torch.Tensor:
+        if not _active_parametrization:
+            return local_shard
+        if (
+            self.compute_device is not None
+            and local_shard.device != self.compute_device
+        ):
+            local_shard = local_shard.to(self.compute_device, non_blocking=True)
+
+        # Pad to max shard size along shard_dim
+        local_size = local_shard.shape[self.shard_dim]
+        pad_size = self.max_shard_size - local_size
+        if pad_size > 0:
+            pad_shape = list(local_shard.shape)
+            pad_shape[self.shard_dim] = pad_size
+            padding = local_shard.new_zeros(pad_shape)
+            local_shard = torch.cat([local_shard, padding], dim=self.shard_dim)
+
+        # Uniform all-gather (all ranks now have max_shard_size)
+        full = torch.ops._c10d_functional.all_gather_into_tensor(
+            local_shard, self.world_size, self.group_name
+        )
+        full = torch.ops._c10d_functional.wait_tensor(full)
+
+        # Reassemble: chunk along dim 0, narrow each to its real size, cat
+        chunks = full.chunk(self.world_size, dim=0)
+        real_chunks = [
+            chunk.narrow(self.shard_dim, 0, self.split_sizes[r])
+            for r, chunk in enumerate(chunks)
+        ]
+        full = torch.cat(real_chunks, dim=self.shard_dim)
+
+        if self.param_dtype is not None or self.reduce_dtype is not None:
+            full = _MixedPrecisionCast.apply(full, self.param_dtype, self.reduce_dtype)
+        return full
+
+
+class DTensorAwareParametrization(nn.Module):
+    """Wrapper that handles nested DTensor inputs from TP/EP composition.
+
+    When the input is a DTensor (e.g., from TP), this:
+    1. Extracts the local tensor via to_local()
+    2. Delegates to the inner parametrization (DP all-gather on plain tensor)
+    3. Re-wraps the result as a DTensor with the original non-DP placements
+
+    When the input is a plain tensor, delegates directly to the inner
+    parametrization.
+    """
+
+    def __init__(self, inner: nn.Module):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not _active_parametrization:
+            return x
+
+        from torch.distributed.tensor import DTensor
+
+        if isinstance(x, DTensor):
+            inner_mesh = x._spec.mesh
+            inner_placements = tuple(x._spec.placements)
+            local = x.to_local(grad_placements=inner_placements)
+            result = self.inner(local)
+            return DTensor.from_local(
+                result, inner_mesh, inner_placements, run_check=False
+            )
+        return self.inner(x)
+
+
+# ---------------------------------------------------------------------------
+# Eager reshard-after-forward via checkpoint + selective AC policy
+# ---------------------------------------------------------------------------
+
+# Collective ops that should be recomputed (not saved) by checkpoint.
+class _RegisterPostBackward(torch.autograd.Function):
+    """Identity on forward inputs; fires a callback in backward.
+
+    Inserted on a layer's forward inputs so that the callback fires AFTER
+    all the layer's parameter gradients are computed. Used for batched
+    reduce-scatter per bucket.
+    """
+
+    @staticmethod
+    def forward(ctx, reduce_fn, *inputs):
+        ctx.reduce_fn = reduce_fn
+        return inputs
+
+    @staticmethod
+    def backward(ctx, *grads):
+        ctx.reduce_fn()
+        return (None,) + grads
+
+
+# These produce the unsharded param tensors that we want freed per-layer.
+_FLEX_SHARD_COLLECTIVE_OPS = {
+    torch.ops._c10d_functional.all_gather_into_tensor.default,
+    torch.ops._c10d_functional.wait_tensor.default,
+    torch.ops._c10d_functional.broadcast.default,
+}
+
+
+def _flex_shard_reshard_policy(ctx, func, *args, **kwargs):
+    """Checkpoint policy for per-layer reshard-after-forward.
+
+    Marks collective ops (all-gather, broadcast, wait_tensor) for
+    recomputation — checkpoint discards their outputs after each layer's
+    forward. All other ops (matmul, attention, etc.) are saved, avoiding
+    redundant compute recomputation in backward.
+    """
+    from torch.utils.checkpoint import CheckpointPolicy
+
+    if func in _FLEX_SHARD_COLLECTIVE_OPS:
+        return CheckpointPolicy.MUST_RECOMPUTE
+    # PREFER_RECOMPUTE lets checkpoint decide what to save vs recompute
+    # for non-collective ops, matching standard AC behavior.
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _compose_reshard_with_ac_policy(ac_context_fn):
+    """Compose FlexShard reshard policy with an existing AC context_fn.
+
+    Returns a new context_fn that wraps the AC policy: FlexShard collective
+    ops are forced to MUST_RECOMPUTE, everything else delegates to the
+    original AC policy. The two op sets are disjoint so no conflicts arise.
+    """
+
+    def merged_context_fn():
+        from torch.utils.checkpoint import CheckpointPolicy
+
+        contexts = ac_context_fn()
+        for ctx in contexts:
+            original_policy = ctx.policy_fn
+
+            def merged_policy(sctx, func, *args, _orig=original_policy, **kwargs):
+                if func in _FLEX_SHARD_COLLECTIVE_OPS:
+                    return CheckpointPolicy.MUST_RECOMPUTE
+                return _orig(sctx, func, *args, **kwargs)
+
+            ctx.policy_fn = merged_policy
+        return contexts
+
+    return merged_context_fn
 
 
 class ShardedState(Enum):
@@ -1781,11 +2206,22 @@ def _create_param_infos(
 
     for fqn, param in named_params:
         placements = param_placements[fqn]
-        global_shape = param.shape
+        # For DTensor params (from TP/EP), FlexShard operates on the
+        # TP-local tensor. Use to_local().shape as the "global shape"
+        # from FlexShard's perspective.
+        param_for_shape = param
+        try:
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(param, DTensor):
+                param_for_shape = param.to_local()
+        except ImportError:
+            pass
+        global_shape = param_for_shape.shape
         global_stride = make_contiguous_strides_for(global_shape)
         local_shape, local_numel = _compute_local_info(global_shape, mesh, placements)
         dtype = param.dtype
-        global_numel = param.numel()
+        global_numel = param_for_shape.numel()
 
         alignment = _get_dtype_alignment(dtype)
 
@@ -1913,7 +2349,16 @@ def _write_params_to_dstorage(
         info = param_infos[fqn]
         if param.device.type == "meta":
             continue
-        shard = info.placements[0].extract_local_shard(param.data, my_rank, world_size)
+        # For DTensor params (from TP/EP), extract the local tensor first
+        param_data = param.data
+        try:
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(param_data, DTensor):
+                param_data = param_data.to_local()
+        except ImportError:
+            pass
+        shard = info.placements[0].extract_local_shard(param_data, my_rank, world_size)
         if shard.numel() > 0:
             nbytes = shard.numel() * shard.element_size()
             byte_storage[info.byte_offset : info.byte_offset + nbytes].copy_(
@@ -2131,6 +2576,22 @@ def flex_shard(
         )
         logger.debug("\n".join(lines))
 
+    # In parametrization mode, adjust placements for traceability:
+    # - FlatShard: decompose bucket-level into per-parameter flat sharding
+    # - Owned: store full param on all ranks (broadcast ensures consistency)
+    if not register_hooks:
+        named_params_dict_tmp = dict(named_params)
+        for fqn in param_placements:
+            placement = param_placements[fqn][0]
+            if isinstance(placement, FlatShard):
+                numel = named_params_dict_tmp[fqn].numel()
+                param_placements[fqn] = (FlatShard(0, numel, numel),)
+            elif isinstance(placement, Owned):
+                # In parametrization mode, all ranks store the full param.
+                # Replace with _OwnedFullCopy so compute_local_shape/numel
+                # and extract_local_shard return the full param for all ranks.
+                param_placements[fqn] = (_OwnedFullCopy(placement.owner_rank),)
+
     # Per-bucket: create param_infos, byte buffer, replace params, create DStorage
     named_params_dict = dict(named_params)
     storages: list[DStorage] = []
@@ -2221,28 +2682,24 @@ def flex_shard(
                 reduce_dtype = mp.reduce_dtype if mp else None
                 compute_device = torch.device(device) if offload is not None else None
                 placement = info.placements[0]
-                if isinstance(placement, Shard):
-                    p = ShardParametrization(
-                        shard_dim=placement.dim,
-                        group_name=group_name,
-                        world_size=world_size,
-                        param_dtype=param_dtype,
-                        reduce_dtype=reduce_dtype,
-                        compute_device=compute_device,
-                    )
-                elif isinstance(placement, FlatShard):
-                    p = FlatShardParametrization(
-                        group_name=group_name,
-                        world_size=world_size,
-                        original_shape=info.global_shape,
-                        param_dtype=param_dtype,
-                        reduce_dtype=reduce_dtype,
-                        compute_device=compute_device,
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported placement for parametrization: " f"{placement}"
-                    )
+                p = placement.create_parametrization(
+                    info,
+                    group_name,
+                    world_size,
+                    param_dtype=param_dtype,
+                    reduce_dtype=reduce_dtype,
+                    compute_device=compute_device,
+                )
+
+                # Wrap for DTensor inputs (TP/EP composition)
+                param = named_params_dict[fqn]
+                try:
+                    from torch.distributed.tensor import DTensor
+
+                    if isinstance(param, DTensor):
+                        p = DTensorAwareParametrization(p)
+                except ImportError:
+                    pass
 
                 # Find the leaf module owning this param
                 parts = fqn.split(".")
@@ -2258,4 +2715,255 @@ def flex_shard(
         for mod, param_map in module_param_map.items():
             _register_parametrization(mod, param_map)
 
+        # Reshard-after-forward: free unsharded params after each layer's
+        # forward, recompute (re-all-gather) in backward.
+        # In compiled modes (JIT/AOT), the graph pass handles this.
+        # In eager mode, we wrap each layer in checkpoint with a selective
+        # policy that recomputes only collective ops (all-gather, broadcast),
+        # saving all compute ops (matmul, attention) to avoid redundant work.
+        if reshard_after_forward:
+            _apply_reshard_checkpoint(module)
+
+        # Install batched all-gather hooks for eager mode.
+        # Each DStorage pre-forward hook runs Placement.unshard() (one batched
+        # collective per bucket), then sets _pre_gathered on each parametrization.
+        # The property getter still calls parametrization.forward(), which
+        # detects _pre_gathered and uses a detached leaf instead of
+        # issuing its own _c10d_functional.all_gather_into_tensor.
+        _install_batched_allgather_hooks(storages, module_param_map)
+
     return module
+
+
+def _wrap_with_reshard(child: nn.Module) -> nn.Module:
+    """Wrap a single module with reshard checkpoint, composing with AC if present.
+
+    If the child is already wrapped by AC's CheckpointWrapper, unwraps it,
+    merges the AC policy with FlexShard's reshard policy, and re-wraps once.
+    If no AC wrapper exists, wraps with reshard-only policy.
+    """
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+        CheckpointWrapper,
+    )
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts
+
+    def _reshard_only_context_fn():
+        return create_selective_checkpoint_contexts(_flex_shard_reshard_policy)
+
+    if isinstance(child, CheckpointWrapper):
+        # AC already applied — unwrap, merge policies, re-wrap
+        inner = child._checkpoint_wrapped_module
+        ac_kwargs = dict(child.checkpoint_fn.keywords)
+        ac_kwargs.pop("use_reentrant", None)
+        ac_context_fn = ac_kwargs.pop("context_fn", None)
+        if ac_context_fn is not None:
+            # Selective AC — merge with reshard policy
+            merged_fn = _compose_reshard_with_ac_policy(ac_context_fn)
+        else:
+            # Full AC — add reshard policy via selective context
+            merged_fn = _reshard_only_context_fn
+        return checkpoint_wrapper(inner, context_fn=merged_fn, **ac_kwargs)
+
+    # No AC — reshard-only wrapping
+    return checkpoint_wrapper(child, context_fn=_reshard_only_context_fn)
+
+
+def _apply_reshard_checkpoint(module: nn.Module) -> None:
+    """Wrap FlexShard-managed children in checkpoint for per-layer reshard.
+
+    Each direct child gets wrapped with a checkpoint policy that marks
+    collective ops (all-gather, broadcast, wait_tensor) as MUST_RECOMPUTE
+    so unsharded params are freed after each layer's forward.
+
+    Composes with activation checkpointing: if a child is already wrapped
+    by AC's CheckpointWrapper, the two policies are merged into a single
+    wrapper (FlexShard collectives → MUST_RECOMPUTE, AC compute ops →
+    MUST_SAVE, everything else → PREFER_RECOMPUTE).
+    """
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.ModuleDict):
+            for key in list(child.keys()):
+                child[key] = _wrap_with_reshard(child[key])
+        elif isinstance(child, nn.ModuleList):
+            for i in range(len(child)):
+                child[i] = _wrap_with_reshard(child[i])
+        else:
+            setattr(module, name, _wrap_with_reshard(child))
+
+
+def _install_batched_allgather_hooks(
+    storages: list,
+    module_param_map: dict[nn.Module, dict[str, nn.Module]],
+) -> None:
+    """Install pre/post forward hooks for batched per-bucket all-gather.
+
+    In eager mode, each DStorage's pre-forward hook runs a single batched
+    Placement.unshard() call (one NCCL collective per bucket), then sets
+    _pre_gathered on each parametrization module so the property getter
+    skips the per-param all-gather.
+
+    Skipped under torch.compile — compiled modes use per-param
+    _c10d_functional ops which the compiler rebatches via graph passes.
+    """
+
+    for storage in storages:
+        infos = list(storage._param_infos.values())
+        if not infos:
+            continue
+
+        ptype = type(infos[0].placements[0])
+        # Skip batching for Owned (per-param broadcast, can't batch)
+        if ptype is _OwnedFullCopy or ptype is Owned:
+            continue
+
+        # Pre-compute (leaf_module, param_name, parametrization, info) for
+        # each param in this bucket. Captured at flex_shard() time (before
+        # checkpoint wrapping changes the module tree).
+        param_entries: list[tuple[nn.Module, str, nn.Module, ParamInfo]] = []
+        for info in infos:
+            parts = info.fqn.split(".")
+            leaf_mod = storage._module
+            for part in parts[:-1]:
+                child = getattr(leaf_mod, part, None)
+                if child is None:
+                    wrapped = getattr(leaf_mod, "_checkpoint_wrapped_module", None)
+                    if wrapped is not None:
+                        leaf_mod = getattr(wrapped, part)
+                    else:
+                        leaf_mod = getattr(leaf_mod, part)
+                else:
+                    leaf_mod = child
+            local_name = parts[-1]
+            # Unwrap CheckpointWrapper to find the original module
+            # that's in module_param_map
+            if hasattr(leaf_mod, "_checkpoint_wrapped_module"):
+                leaf_mod = leaf_mod._checkpoint_wrapped_module
+            if leaf_mod in module_param_map:
+                param_p = module_param_map[leaf_mod].get(local_name)
+                if param_p is not None:
+                    param_entries.append((leaf_mod, local_name, param_p, info))
+
+        logger.debug(f"Batched hooks: {len(param_entries)}/{len(infos)} params matched")
+        if not param_entries:
+            continue
+
+        def make_hooks(s, entries, pt):
+            # Collected grads from AccumulateGrad hooks (indexed by position)
+            collected_grads: dict[int, torch.Tensor] = {}
+
+            def _reduce_fn():
+                """Batched reduce-scatter using collected grads."""
+                grads, valid = [], []
+                for idx, (leaf, name, param_p, info) in enumerate(entries):
+                    g = collected_grads.pop(idx, None)
+                    if g is not None:
+                        grads.append(g)
+                        valid.append((leaf, name, info))
+                    param_p._unsharded_for_reduce = None
+                if not grads:
+                    return
+                valid_infos = [i for _, _, i in valid]
+                with torch.no_grad():
+                    reduced = pt.reduce_grad(grads, valid_infos, s._mesh)
+                for (leaf, name, _), rg in zip(valid, reduced):
+                    param = leaf._parameters[name]
+                    if rg.dtype != param.dtype:
+                        rg = rg.to(param.dtype)
+                    if param.grad is None:
+                        param.grad = rg
+                    else:
+                        param.grad += rg
+
+            def pre_forward_hook(mod, args):
+                if torch.compiler.is_compiling():
+                    return
+                # Batched all-gather
+                local_shards = [
+                    leaf._parameters[name].data for leaf, name, _, _ in entries
+                ]
+                entry_infos = [info for _, _, _, info in entries]
+                with torch.no_grad():
+                    full_params = pt.unshard(local_shards, entry_infos, s._mesh)
+                for (_, _, param_p, _), full_param in zip(entries, full_params):
+                    param_p._pre_gathered = full_param
+
+            def post_forward_hook(mod, args, output):
+                if torch.compiler.is_compiling():
+                    return
+                for _, _, param_p, _ in entries:
+                    param_p._pre_gathered = None
+
+                # Register AccumulateGrad hooks on detached leaf params.
+                # Each hook stores its grad by index. The last hook fires
+                # _reduce_fn with all collected grads (u.grad is None at
+                # hook time — grads must be captured from the hook argument).
+                if torch.is_grad_enabled():
+                    collected_grads.clear()
+                    leaf_indices = []
+                    for idx, (_, _, param_p, _) in enumerate(entries):
+                        u = getattr(param_p, "_unsharded_for_reduce", None)
+                        if u is not None and u.requires_grad:
+                            leaf_indices.append((idx, u))
+
+                    if leaf_indices:
+                        grad_count = [0]
+                        n = len(leaf_indices)
+
+                        def _make_hook(i):
+                            def _on_grad(grad):
+                                collected_grads[i] = grad
+                                grad_count[0] += 1
+                                if grad_count[0] >= n:
+                                    _reduce_fn()
+                                    grad_count[0] = 0
+
+                            return _on_grad
+
+                        for idx, leaf in leaf_indices:
+                            leaf.register_hook(_make_hook(idx))
+
+            return pre_forward_hook, post_forward_hook
+
+        pre_hook, post_hook = make_hooks(storage, param_entries, ptype)
+
+        # Register hooks on the bucket's child module (not root) so they
+        # fire during checkpoint recomputation in backward too.
+        # Navigate through CheckpointWrapper to the inner module.
+        target = _get_bucket_module(storage)
+        inner = getattr(target, "_checkpoint_wrapped_module", target)
+        inner.register_forward_pre_hook(pre_hook)
+        inner.register_forward_hook(post_hook)
+
+
+def _get_bucket_module(storage) -> nn.Module:
+    """Find the deepest common ancestor module for a bucket's params.
+
+    For bucket "layers.0.*", returns model.layers[0].
+    For bucket "norm.*, output.*" (no common prefix), returns root.
+    """
+    fqns = list(storage._param_infos.keys())
+    # Get module-level prefixes (strip param name)
+    prefixes = [".".join(fqn.split(".")[:-1]) for fqn in fqns]
+    # Find common prefix
+    if not prefixes:
+        return storage._module
+    common = prefixes[0]
+    for p in prefixes[1:]:
+        # Find common prefix character by character, then trim to last "."
+        i = 0
+        while i < len(common) and i < len(p) and common[i] == p[i]:
+            i += 1
+        common = common[:i]
+    # Trim to last complete component (don't split mid-name)
+    if "." in common:
+        common = common[: common.rfind(".") + 1].rstrip(".")
+    elif common and common not in prefixes:
+        # Partial match — not a complete component
+        common = ""
+    if not common:
+        return storage._module
+    mod = storage._module
+    for part in common.split("."):
+        mod = getattr(mod, part)
+    return mod
