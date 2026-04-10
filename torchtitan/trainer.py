@@ -211,6 +211,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
 
+        # Determine init device and mesh device type. Seed checkpoints use
+        # CPU for both — gloo mesh avoids NCCL hangs on CPU tensors during
+        # DTensor collectives in init_weights.
+        buffer_device: torch.device | None
+        if config.checkpoint.create_seed_checkpoint:
+            init_device = "cpu"
+            buffer_device = None
+            mesh_device_type = "cpu"
+        elif config.training.enable_cpu_offload:
+            init_device = "cpu"
+            buffer_device = torch.device(device_type)
+            mesh_device_type = device_type
+        else:
+            init_device = device_type
+            buffer_device = None
+            mesh_device_type = device_type
+        parallel_dims.build_mesh(mesh_device_type)
+
         # Logging needs to happen after distributed initialized
         config.maybe_log()
 
@@ -307,18 +325,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"{color.blue}Model {model_spec.name} {model_spec.flavor} "
             f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
         )
-
-        # move sharded model to CPU/GPU and initialize weights via DTensor
-        buffer_device: torch.device | None
-        if config.checkpoint.create_seed_checkpoint:
-            init_device = "cpu"
-            buffer_device = None
-        elif config.training.enable_cpu_offload:
-            init_device = "cpu"
-            buffer_device = torch.device(device_type)
-        else:
-            init_device = device_type
-            buffer_device = None
 
         self.loss_fn = model_spec.build_loss_fn(
             config.compile, parallel_dims=parallel_dims

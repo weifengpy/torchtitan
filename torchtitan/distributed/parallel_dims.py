@@ -12,7 +12,6 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import device_type
 
 
 __all__ = ["ParallelDims"]
@@ -87,7 +86,7 @@ class ParallelDims:
             return True if self.ep > 1 else False
         return degree > 1
 
-    def build_mesh(self) -> DeviceMesh:
+    def build_mesh(self, device_type: str) -> DeviceMesh:
         """
         Build the device mesh with the required mesh dimensions.
 
@@ -251,7 +250,9 @@ class ParallelDims:
             ValueError: If the requested dimension name(s) is not valid.
         """
         if not self._meshes:
-            self.build_mesh()
+            raise RuntimeError(
+                "Device mesh not built. Call build_mesh(device_type) first."
+            )
 
         if isinstance(dims, str):
             dims = [dims]
@@ -326,13 +327,17 @@ class ParallelDims:
             dict_keys(['dp_replicate', 'fsdp', 'tp', 'batch', 'loss', 'efsdp'])
         """
         if not self._meshes:
-            self.build_mesh()
+            raise RuntimeError(
+                "Device mesh not built. Call build_mesh(device_type) first."
+            )
         return {k: v for k, v in self._meshes.items() if v.ndim == 1 and v.size() > 1}
 
     @property
     def world_mesh(self) -> DeviceMesh:
         if self._world_mesh is None:
-            self._world_mesh = self.build_mesh()
+            raise RuntimeError(
+                "Device mesh not built. Call build_mesh(device_type) first."
+            )
         return self._world_mesh
 
     @property

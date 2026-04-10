@@ -125,7 +125,7 @@ def main():
         etp=parallelism.expert_tensor_parallel_degree,
         world_size=world_size,
     )
-    parallel_dims.build_mesh()
+    parallel_dims.build_mesh(utils.device_type)
 
     model_spec = config.model_spec
     if model_spec is None:

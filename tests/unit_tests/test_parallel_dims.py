@@ -290,15 +290,14 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             etp=1,
             world_size=1,
         )
-        parallel_dims.build_mesh()
+        parallel_dims.build_mesh("cpu")
 
         with self.assertRaises(ValueError) as context:
             parallel_dims.get_mesh("invalid_mesh")
         self.assertIn("Invalid mesh dim", str(context.exception))
 
-    @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
-    def test_get_mesh_lazy_initialization(self):
-        """Test that get_optional_mesh triggers build_mesh if not built yet."""
+    def test_get_mesh_without_build_raises(self):
+        """Test that get_optional_mesh raises if build_mesh was not called."""
         parallel_dims = ParallelDims(
             dp_replicate=1,
             dp_shard=1,
@@ -309,13 +308,8 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             etp=1,
             world_size=1,
         )
-        # Don't call build_mesh explicitly
-        self.assertEqual(len(parallel_dims._meshes), 0)
-
-        # get_optional_mesh should trigger build_mesh
-        result = parallel_dims.get_optional_mesh("tp")
-        # Result is None because tp has size 1, but build_mesh should have been called
-        self.assertGreater(len(parallel_dims._meshes), 0)
+        with self.assertRaises(RuntimeError):
+            parallel_dims.get_optional_mesh("tp")
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
     def test_single_rank_mesh_operations(self):
@@ -405,7 +399,7 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             etp=1,
             world_size=1,
         )
-        parallel_dims.build_mesh()
+        parallel_dims.build_mesh("cpu")
 
         # Should accept list input
         result = parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
@@ -476,7 +470,7 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
             )
 
             # Test mesh building
-            world_mesh = parallel_dims.build_mesh()
+            world_mesh = parallel_dims.build_mesh(self.device_type)
             self.assertIsNotNone(world_mesh)
             self.assertEqual(world_mesh.size(), 8)
 
